@@ -10,7 +10,7 @@ const client = function () {
   return client
 }
 
-const psql = '/opt/postgresql-9.6.1/bin/psql'
+const psql = 'psql'
 const limit = 999999
 const inStream = function () {
   return cp.spawn('seq', ['0', '' + limit])
