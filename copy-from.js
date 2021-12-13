@@ -7,17 +7,33 @@ module.exports = function (txt, options) {
 const { Writable } = require('stream')
 const code = require('./message-formats')
 
+// Lifecycle:
+//     0. database is ReadyForQuery
+//     1. construct stream
+//     2. user calls client.query(copyFromStream)
+//     3. pg calls submit which sends the query
+//     4. pg calls handleCopyInResponse
+//     5. send csv bytes
+//     6. send CopyDone
+//     7. pg calls handleReadyForQuery
 class CopyStreamQuery extends Writable {
   constructor(text, options) {
     super(options)
     this.text = text
     this.rowCount = 0
     this._gotCopyInResponse = false
-    this.chunks = []
+    this.bufferedChunks = []
+    this.bufferedLength = 0
+    this.maxBuffer = (options && options.maxBuffer) || 1024 * 512
     this.cb_CopyInResponse = null
     this.cb_ReadyForQuery = null
     this.cb_destroy = null
+    this.calls = {}
     this.cork()
+  }
+
+  stats(method, count) {
+    this.calls[method] = this.calls[method] + count || count
   }
 
   submit(connection) {
@@ -31,20 +47,22 @@ class CopyStreamQuery extends Writable {
     // with its timeout mechanism when query_timeout config is set
   }
 
-  _write(chunk, enc, cb) {
-    this.chunks.push({ chunk: chunk, encoding: enc })
-    if (this._gotCopyInResponse) {
-      return this.flush(cb)
-    }
-    this.cb_CopyInResponse = cb
+  sendBatches(cb) {
+    this.stats('sendBatches', 1)
+    this.sendBuffer(Buffer.concat(this.bufferedChunks), cb)
+    this.bufferedChunks = []
+    this.bufferedLength = 0
   }
 
-  _writev(chunks, cb) {
-    this.chunks.push(...chunks)
-    if (this._gotCopyInResponse) {
-      return this.flush(cb)
+  _write(chunk, enc, cb) {
+    this.stats('write', 1)
+    this.bufferedChunks.push(chunk)
+    this.bufferedLength += Buffer.byteLength(chunk)
+    if (this.bufferedLength > this.maxBuffer && this._gotCopyInResponse === true) {
+      this.sendBatches(cb)
+    } else {
+      cb()
     }
-    this.cb_CopyInResponse = cb
   }
 
   _destroy(err, cb) {
@@ -59,54 +77,48 @@ class CopyStreamQuery extends Writable {
     const done = function () {
       self.connection.sendCopyFail(msg)
     }
-
-    this.chunks = []
     if (this._gotCopyInResponse) {
-      return this.flush(done)
+      done()
+    } else {
+      this.cb_CopyInResponse = done
     }
-    this.cb_CopyInResponse = done
   }
 
   _final(cb) {
-    this.cb_ReadyForQuery = cb
-    const self = this
-    const done = function () {
-      const Int32Len = 4
-      const finBuffer = Buffer.from([code.CopyDone, 0, 0, 0, Int32Len])
-      self.connection.stream.write(finBuffer)
-    }
-
     if (this._gotCopyInResponse) {
-      return this.flush(done)
-    }
-    this.cb_CopyInResponse = done
-  }
-
-  flush(callback) {
-    let chunk
-    let ok = true
-    while (ok && (chunk = this.chunks.shift())) {
-      ok = this.flushChunk(chunk.chunk)
-    }
-    if (callback) {
-      if (ok) {
-        callback()
-      } else {
-        if (this.chunks.length) {
-          this.connection.stream.once('drain', this.flush.bind(this, callback))
-        } else {
-          this.connection.stream.once('drain', callback)
-        }
-      }
+      this.sendBatchesAndCopyDone(cb)
+    } else {
+      this.cb_CopyInResponse = () => this.sendBatchesAndCopyDone(cb)
     }
   }
 
-  flushChunk(chunk) {
+  sendCopyDone(cb) {
+    this.stats('done', 1)
+    this.cb_ReadyForQuery = cb
+    const Int32Len = 4
+    const finBuffer = Buffer.from([code.CopyDone, 0, 0, 0, Int32Len])
+    this.connection.stream.write(finBuffer)
+  }
+
+  sendBatchesAndCopyDone(cb) {
+    if (this.bufferedLength > 0) {
+      this.sendBatches(() => this.sendCopyDone(cb))
+    } else {
+      this.sendCopyDone(cb)
+    }
+  }
+
+  sendBuffer(buffer, cb) {
+    this.stats('sendBuffer', 1)
     const Int32Len = 4
     const lenBuffer = Buffer.from([code.CopyData, 0, 0, 0, 0])
-    lenBuffer.writeUInt32BE(chunk.length + Int32Len, 1)
+    lenBuffer.writeUInt32BE(buffer.length + Int32Len, 1)
     this.connection.stream.write(lenBuffer)
-    return this.connection.stream.write(chunk)
+    if (this.connection.stream.write(buffer)) {
+      cb()
+    } else {
+      this.connection.stream.once('drain', cb)
+    }
   }
 
   handleError(e) {
@@ -128,9 +140,7 @@ class CopyStreamQuery extends Writable {
     if (!this.destroyed) {
       this.uncork()
     }
-    const cb = this.cb_CopyInResponse || function () {}
-    this.cb_CopyInResponse = null
-    this.flush(cb)
+    this.cb_CopyInResponse && this.cb_CopyInResponse()
   }
 
   handleCommandComplete(msg) {
